@@ -54,6 +54,17 @@
   details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px}
   textarea{min-height:90px;margin-top:8px;resize:vertical}
   .small{font-size:13px;padding:6px 10px}
+  li input[type=checkbox]{width:18px;height:18px;margin:0;flex:none;accent-color:var(--accent);cursor:pointer}
+  li.off .name{color:var(--muted);text-decoration:line-through}
+  .listhead{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:10px}
+  .listhead .btns{display:flex;gap:6px}
+  .history{width:100%;max-width:560px}
+  .history h2{font-size:14px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);margin:6px 0 8px}
+  .hlist{max-height:320px;overflow:auto;border-top:1px solid var(--border)}
+  .hrow{display:grid;grid-template-columns:28px minmax(0,1fr) auto;gap:10px;align-items:baseline;padding:7px 2px;border-bottom:1px solid var(--border)}
+  .hrow .n{color:var(--muted);font-size:12px;text-align:right}
+  .hrow .g{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .hrow .w{color:var(--muted);font-size:13px;text-align:right;white-space:nowrap}
   .toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--border);padding:10px 16px;border-radius:10px;opacity:0;transition:opacity .2s;pointer-events:none}
   .toast.show{opacity:1}
 </style>
@@ -73,7 +84,12 @@
         <div class="hub" id="hub" role="button" tabindex="0">SPIN</div>
       </div>
       <button class="spinbtn" id="spinBtn">Spin</button>
+      <div class="muted" id="spinHint" hidden>Enter your name to spin</div>
       <div class="result" id="result"><div class="meta">Nobody has spun yet.</div></div>
+      <div class="history">
+        <h2>Recent spins</h2>
+        <div class="hlist" id="history"><div class="muted" style="padding:8px 2px">No spins yet.</div></div>
+      </div>
     </section>
 
     <aside class="side">
@@ -87,6 +103,10 @@
           <input id="newItem" maxlength="40" placeholder="Add a game…" autocomplete="off">
           <button type="submit">Add</button>
         </form>
+        <div class="listhead">
+          <span class="muted" id="poolInfo">Ticked games are in the spin pool</span>
+          <span class="btns"><button class="small" id="allOn">All</button><button class="small" id="allOff">None</button></span>
+        </div>
         <ul id="list"></ul>
         <details>
           <summary>Paste many at once</summary>
@@ -113,12 +133,13 @@
   // Private room id. Change it (or open the page with ?room=something) for a separate wheel.
   const ROOM = new URLSearchParams(location.search).get("room") || "29cb17bb6f02";
   const BASE = "gamewheel-v1/" + ROOM;
-  const T_ITEMS = BASE + "/items", T_SPIN = BASE + "/spin";
-  const SPIN_MS = 6000, MAX_ITEMS = 80, MAX_LEN = 40;
+  const T_ITEMS = BASE + "/items", T_SPIN = BASE + "/spin", T_HIST = BASE + "/history";
+  const SPIN_MS = 6000, MAX_ITEMS = 80, MAX_LEN = 40, MAX_HISTORY = 50;
   const COLORS = ["#ef476f","#f78c6b","#ffd166","#83d483","#06d6a0","#0cb0a9","#118ab2","#5b7bd5","#8e6bd8","#c86bd8","#e56b9e","#a3a948"];
 
   // ---- State --------------------------------------------------------------
-  let items = [];           // shared list
+  let items = [];           // shared list: [{name, on}]
+  let history = [];         // shared: [{game, by, ts}] newest first
   let lastSpin = null;      // last spin message
   let rotation = 0;         // current wheel rotation (radians, clockwise)
   let anim = null;          // running animation
@@ -128,11 +149,16 @@
   const canvas = $("wheel"), ctx = canvas.getContext("2d");
   const nick = $("nick");
   try { nick.value = localStorage.getItem("gw-nick") || ""; } catch {}
-  nick.addEventListener("input", () => { try { localStorage.setItem("gw-nick", nick.value.trim()); } catch {} });
+  nick.addEventListener("input", () => { try { localStorage.setItem("gw-nick", nick.value.trim()); } catch {} updateButtons(); });
   const myName = () => nick.value.trim().slice(0, 24) || "Someone";
 
   const clean = s => String(s ?? "").replace(/\s+/g, " ").trim().slice(0, MAX_LEN);
-  const validItems = arr => Array.isArray(arr) ? arr.map(clean).filter(Boolean).slice(0, MAX_ITEMS) : null;
+  const validNames = arr => Array.isArray(arr) ? arr.map(clean).filter(Boolean).slice(0, MAX_ITEMS) : null;
+  // items may be plain strings (older version) or {name,on}
+  const validItems = arr => Array.isArray(arr) ? arr.map(x => (x && typeof x === "object")
+      ? { name: clean(x.name), on: x.on !== false }
+      : { name: clean(x), on: true }).filter(x => x.name).slice(0, MAX_ITEMS) : null;
+  const pool = () => items.filter(x => x.on).map(x => x.name);
 
   function toast(msg){ const t=$("toast"); t.textContent=msg; t.classList.add("show"); clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove("show"),2200); }
 
@@ -171,25 +197,50 @@
 
   function render(){
     if (anim) return; // animation draws its own frames
-    draw(items, rotation);
+    draw(pool(), rotation);
   }
 
   function renderList(){
     const ul = $("list"); ul.textContent = "";
+    const p = pool();
+    let k = 0;
     items.forEach((it, i) => {
-      const li = document.createElement("li");
-      const sw = document.createElement("span"); sw.className="sw"; sw.style.background = colorFor(i, items.length);
-      const nm = document.createElement("span"); nm.className="name"; nm.textContent = it; nm.title = it;
-      const rm = document.createElement("button"); rm.textContent="✕"; rm.title="Remove"; rm.setAttribute("aria-label","Remove "+it);
-      rm.onclick = () => setItems(items.filter((_, j) => j !== i), `removed ${it}`);
-      li.append(sw, nm, rm); ul.append(li);
+      const li = document.createElement("li"); if (!it.on) li.className = "off";
+      const cb = document.createElement("input"); cb.type = "checkbox"; cb.checked = it.on;
+      cb.title = it.on ? "In the pool – untick to leave out" : "Left out – tick to include";
+      cb.setAttribute("aria-label", "Include " + it.name);
+      cb.onchange = () => setItems(items.map((x, j) => j === i ? { ...x, on: cb.checked } : x));
+      const sw = document.createElement("span"); sw.className="sw";
+      sw.style.background = it.on ? colorFor(k++, p.length) : "transparent";
+      if (!it.on) sw.style.border = "1px solid var(--border)";
+      const nm = document.createElement("span"); nm.className="name"; nm.textContent = it.name; nm.title = it.name;
+      const rm = document.createElement("button"); rm.textContent="✕"; rm.title="Remove"; rm.setAttribute("aria-label","Remove "+it.name);
+      rm.onclick = () => setItems(items.filter((_, j) => j !== i), `removed ${it.name}`);
+      li.append(cb, sw, nm, rm); ul.append(li);
     });
-    $("count").textContent = items.length ? `(${items.length})` : "";
+    $("count").textContent = items.length ? `(${p.length} of ${items.length} in pool)` : "";
+    $("poolInfo").textContent = p.length < 2 && items.length ? "Tick at least 2 games to spin" : "Ticked games are in the spin pool";
     updateButtons();
   }
 
+  function renderHistory(){
+    const box = $("history"); box.textContent = "";
+    if (!history.length){ const m=document.createElement("div"); m.className="muted"; m.style.padding="8px 2px"; m.textContent="No spins yet."; box.append(m); return; }
+    const fmt = new Intl.DateTimeFormat(undefined, { year:"numeric", month:"short", day:"numeric", hour:"2-digit", minute:"2-digit" });
+    history.forEach((h, i) => {
+      const row = document.createElement("div"); row.className = "hrow";
+      const n = document.createElement("span"); n.className="n"; n.textContent = (i+1) + ".";
+      const g = document.createElement("span"); g.className="g"; g.textContent = h.game; g.title = h.game;
+      const w = document.createElement("span"); w.className="w"; w.textContent = `${h.by} · ${fmt.format(new Date(h.ts))}`;
+      row.append(n, g, w); box.append(row);
+    });
+  }
+
   function updateButtons(){
-    const can = connected && items.length >= 2 && !anim;
+    const named = nick.value.trim().length > 0;
+    const can = connected && pool().length >= 2 && !anim && named;
+    $("spinHint").hidden = named;
+    nick.style.borderColor = named ? "" : "var(--accent)";
     $("spinBtn").disabled = !can;
     $("hub").setAttribute("aria-disabled", String(!can));
   }
@@ -225,17 +276,26 @@
       rotation = from + (to - from) * ease(t);
       draw(spin.items, rotation);
       if (t < 1) anim.raf = requestAnimationFrame(step);
-      else { anim = null; rotation = to % (Math.PI*2); showResult(spin, true); render(); updateButtons(); }
+      else {
+        anim = null; rotation = to % (Math.PI*2); showResult(spin, true); render(); updateButtons();
+        // the person who spun records it once the wheel stops (so the list never spoils the result)
+        if (spin.id === mySpinId) {
+          mySpinId = null;
+          const entry = { id: spin.id, game: spin.items[spin.winner], by: spin.by, ts: spin.ts };
+          publish(T_HIST, { history: [entry, ...history.filter(h => h.id !== spin.id)].slice(0, MAX_HISTORY) });
+        }
+      }
     };
     anim.raf = requestAnimationFrame(step);
   }
 
   function doSpin(){
+    if (!nick.value.trim()) { toast("Enter your name first"); nick.focus(); return; }
     if ($("spinBtn").disabled) return;
-    const n = items.length;
+    const list = pool(), n = list.length;
     const spin = {
       id: Math.random().toString(36).slice(2),
-      items: items.slice(),
+      items: list,
       winner: Math.floor(Math.random()*n),
       offset: 0.15 + Math.random()*0.7,     // where inside the slice it stops
       turns: 5 + Math.floor(Math.random()*3),
@@ -243,8 +303,10 @@
       by: myName(),
       ts: Date.now()
     };
+    mySpinId = spin.id;
     publish(T_SPIN, spin);
   }
+  let mySpinId = null;
 
   // ---- Shared list edits --------------------------------------------------
   function setItems(next, what){
@@ -253,12 +315,14 @@
     if (what) toast(what.charAt(0).toUpperCase() + what.slice(1));
   }
   function addMany(arr){
-    const lower = new Set(items.map(x => x.toLowerCase()));
+    const lower = new Set(items.map(x => x.name.toLowerCase()));
     const add = arr.map(clean).filter(x => x && !lower.has(x.toLowerCase()) && (lower.add(x.toLowerCase()), true));
-    if (!add.length) return toast("Already on the wheel");
+    if (!add.length) return toast("Already on the list");
     if (items.length + add.length > MAX_ITEMS) return toast(`Max ${MAX_ITEMS} games`);
-    setItems(items.concat(add), add.length === 1 ? `added ${add[0]}` : `added ${add.length} games`);
+    setItems(items.concat(add.map(name => ({ name, on: true }))), add.length === 1 ? `added ${add[0]}` : `added ${add.length} games`);
   }
+  $("allOn").onclick = () => setItems(items.map(x => ({ ...x, on: true })));
+  $("allOff").onclick = () => setItems(items.map(x => ({ ...x, on: false })));
 
   $("addForm").addEventListener("submit", e => { e.preventDefault(); const v=$("newItem").value; if (clean(v)) { addMany([v]); $("newItem").value=""; } });
   $("bulkAdd").onclick = () => { addMany($("bulk").value.split("\n")); $("bulk").value=""; };
@@ -266,7 +330,7 @@
     const list = validItems($("bulk").value.split("\n")) || [];
     if (!list.length) return toast("Paste some games first");
     if (!confirm(`Replace the whole list with ${list.length} games for everyone?`)) return;
-    setItems([...new Map(list.map(x=>[x.toLowerCase(),x])).values()], "list replaced"); $("bulk").value="";
+    setItems([...new Map(list.map(x=>[x.name.toLowerCase(),x])).values()], "list replaced"); $("bulk").value="";
   };
   $("spinBtn").onclick = doSpin;
   $("hub").onclick = doSpin;
@@ -285,9 +349,14 @@
     if (topic === T_ITEMS){
       const list = validItems(msg && msg.items); if (!list) return;
       items = list; renderList(); render();
+    } else if (topic === T_HIST){
+      const h = msg && Array.isArray(msg.history) ? msg.history : null; if (!h) return;
+      history = h.filter(x => x && clean(x.game)).slice(0, MAX_HISTORY)
+        .map(x => ({ id: String(x.id || ""), game: clean(x.game), by: clean(x.by).slice(0,24) || "Someone", ts: +x.ts || 0 }));
+      renderHistory();
     } else if (topic === T_SPIN){
       const s = msg;
-      const list = validItems(s && s.items);
+      const list = validNames(s && s.items);
       if (!list || list.length < 1 || !Number.isInteger(s.winner) || s.winner < 0 || s.winner >= list.length) return;
       const spin = { id:String(s.id||""), items:list, winner:s.winner,
         offset: Math.min(0.95, Math.max(0.05, +s.offset || 0.5)),
@@ -312,7 +381,7 @@
     });
     client.on("connect", () => {
       setStatus(true, "Live");
-      client.subscribe([T_ITEMS, T_SPIN], { qos: 1 });
+      client.subscribe([T_ITEMS, T_SPIN, T_HIST], { qos: 1 });
     });
     client.on("reconnect", () => setStatus(false, "Reconnecting…"));
     client.on("offline", () => setStatus(false, "Offline – retrying…"));
@@ -321,7 +390,7 @@
   }
 
   renderList(); render(); connect();
-  window.__gw = { get items(){return items;}, get lastSpin(){return lastSpin;}, get spinning(){return !!anim;} };
+  window.__gw = { get items(){return items;}, get history(){return history;}, get lastSpin(){return lastSpin;}, get spinning(){return !!anim;} };
 })();
 </script>
 </body>
